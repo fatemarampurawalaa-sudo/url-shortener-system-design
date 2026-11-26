@@ -1,7 +1,8 @@
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 from datetime import datetime, timezone
 import queue
 import random
@@ -9,8 +10,6 @@ import sqlite3
 import string
 import threading
 import time
-
-app = FastAPI(title="URL Shortener")
 
 DB_FILE = "links.db"
 
@@ -20,14 +19,16 @@ cache = OrderedDict()
 cache_hits = 0
 cache_misses = 0
 
-# Step 4: queue for clicks (saved to the database in batches)
+# Step 4: queue for clicks
 click_queue = queue.Queue()
 batches_written = 0
 clicks_written = 0
+write_lock = threading.Lock()
 
 
 def run(sql, params=()):
-    conn = sqlite3.connect(DB_FILE)
+    # Step 6: wait up to 5 seconds if the database is busy, instead of failing
+    conn = sqlite3.connect(DB_FILE, timeout=5)
     conn.row_factory = sqlite3.Row
     try:
         with conn:
@@ -44,32 +45,58 @@ run("""
         created_at  TEXT NOT NULL
     )
 """)
+# Step 6: index on long_url so we can quickly check "was this URL already shortened?"
+run("CREATE INDEX IF NOT EXISTS idx_links_long_url ON links(long_url)")
 
 
-def click_worker():
-    """Background worker: collects clicks for 2 seconds, then saves them in one go."""
-    global batches_written, clicks_written
+def drain_queue():
+    """Take every click waiting in the queue and count them per code."""
+    batch = {}
     while True:
-        first = click_queue.get()  # wait until at least one click arrives
-        batch = {first: 1}
-        time.sleep(2)  # collect more clicks for 2 seconds
-        while True:
-            try:
-                code = click_queue.get_nowait()
-            except queue.Empty:
-                break
-            batch[code] = batch.get(code, 0) + 1
+        try:
+            code = click_queue.get_nowait()
+        except queue.Empty:
+            return batch
+        batch[code] = batch.get(code, 0) + 1
+
+
+def save_batch(batch):
+    """Save a batch of clicks. Step 6: retry up to 3 times if the database is busy."""
+    global batches_written, clicks_written
+    if not batch:
+        return
+    with write_lock:
         for code, count in batch.items():
-            run("UPDATE links SET clicks = clicks + ? WHERE code = ?", (count, code))
-            clicks_written += count
+            for attempt in range(3):
+                try:
+                    run("UPDATE links SET clicks = clicks + ? WHERE code = ?", (count, code))
+                    clicks_written += count
+                    break
+                except sqlite3.OperationalError:
+                    time.sleep(0.5)
         batches_written += 1
 
 
-threading.Thread(target=click_worker, daemon=True).start()
+def click_worker():
+    """Background worker: every 2 seconds, save whatever clicks are waiting."""
+    while True:
+        time.sleep(2)
+        save_batch(drain_queue())
+
+
+@asynccontextmanager
+async def lifespan(app):
+    threading.Thread(target=click_worker, daemon=True).start()
+    yield
+    # Step 6: on shutdown, save clicks still waiting in the queue (don't lose them)
+    save_batch(drain_queue())
+
+
+app = FastAPI(title="URL Shortener", lifespan=lifespan)
 
 
 class ShortenRequest(BaseModel):
-    url: str
+    url: HttpUrl  # Step 6: must be a real http(s) URL, "string" is rejected
 
 
 def make_code(length=6):
@@ -94,15 +121,26 @@ def get_long_url(code):
 
 @app.post("/shorten")
 def shorten(request: ShortenRequest):
+    long_url = str(request.url)
+    # Step 6: same URL twice -> return the same code (idempotent)
+    existing = run("SELECT code FROM links WHERE long_url = ?", (long_url,))
+    if existing:
+        return {"short_code": existing["code"], "long_url": long_url, "already_existed": True}
     while True:
         code = make_code()
         if run("SELECT 1 FROM links WHERE code = ?", (code,)) is None:
             break
     run(
         "INSERT INTO links (code, long_url, created_at) VALUES (?, ?, ?)",
-        (code, request.url, datetime.now(timezone.utc).isoformat()),
+        (code, long_url, datetime.now(timezone.utc).isoformat()),
     )
-    return {"short_code": code, "long_url": request.url}
+    return {"short_code": code, "long_url": long_url, "already_existed": False}
+
+
+@app.get("/health")
+def health():
+    run("SELECT 1")  # proves the database is reachable
+    return {"status": "ok"}
 
 
 @app.get("/cache-stats")
@@ -132,5 +170,5 @@ def go(code: str):
     long_url = get_long_url(code)
     if long_url is None:
         raise HTTPException(status_code=404, detail="Short link not found")
-    click_queue.put(code)  # just drop the click in the queue, don't wait for the DB
+    click_queue.put(code)
     return RedirectResponse(long_url)
