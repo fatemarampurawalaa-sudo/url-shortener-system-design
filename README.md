@@ -33,4 +33,9 @@ A URL shortening service (similar to bit.ly) built with FastAPI, designed around
 
 ```bash
 pip install fastapi uvicorn
-uvicorn main:app --reload
+uvicorn main:app --reload```
+
+Then open `http://127.0.0.1:8000/docs` to try the API.
+
+## Tech
+Python · FastAPI · SQLite
