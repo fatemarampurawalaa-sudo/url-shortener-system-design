@@ -3,19 +3,27 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from datetime import datetime, timezone
+import queue
 import random
 import sqlite3
 import string
+import threading
+import time
 
 app = FastAPI(title="URL Shortener")
 
 DB_FILE = "links.db"
 
-# Step 3: cache popular links in memory (max 100, oldest-unused removed first)
+# Step 3: cache
 CACHE_SIZE = 100
 cache = OrderedDict()
 cache_hits = 0
 cache_misses = 0
+
+# Step 4: queue for clicks (saved to the database in batches)
+click_queue = queue.Queue()
+batches_written = 0
+clicks_written = 0
 
 
 def run(sql, params=()):
@@ -38,6 +46,28 @@ run("""
 """)
 
 
+def click_worker():
+    """Background worker: collects clicks for 2 seconds, then saves them in one go."""
+    global batches_written, clicks_written
+    while True:
+        first = click_queue.get()  # wait until at least one click arrives
+        batch = {first: 1}
+        time.sleep(2)  # collect more clicks for 2 seconds
+        while True:
+            try:
+                code = click_queue.get_nowait()
+            except queue.Empty:
+                break
+            batch[code] = batch.get(code, 0) + 1
+        for code, count in batch.items():
+            run("UPDATE links SET clicks = clicks + ? WHERE code = ?", (count, code))
+            clicks_written += count
+        batches_written += 1
+
+
+threading.Thread(target=click_worker, daemon=True).start()
+
+
 class ShortenRequest(BaseModel):
     url: str
 
@@ -47,11 +77,10 @@ def make_code(length=6):
 
 
 def get_long_url(code):
-    """Check the cache first; only go to the database on a miss."""
     global cache_hits, cache_misses
     if code in cache:
         cache_hits += 1
-        cache.move_to_end(code)  # mark as recently used
+        cache.move_to_end(code)
         return cache[code]
     cache_misses += 1
     row = run("SELECT long_url FROM links WHERE code = ?", (code,))
@@ -59,7 +88,7 @@ def get_long_url(code):
         return None
     cache[code] = row["long_url"]
     if len(cache) > CACHE_SIZE:
-        cache.popitem(last=False)  # remove least recently used
+        cache.popitem(last=False)
     return row["long_url"]
 
 
@@ -81,6 +110,15 @@ def cache_stats():
     return {"hits": cache_hits, "misses": cache_misses, "cached_links": len(cache)}
 
 
+@app.get("/queue-stats")
+def queue_stats():
+    return {
+        "waiting_in_queue": click_queue.qsize(),
+        "batches_written": batches_written,
+        "clicks_written": clicks_written,
+    }
+
+
 @app.get("/stats/{code}")
 def stats(code: str):
     row = run("SELECT * FROM links WHERE code = ?", (code,))
@@ -94,5 +132,5 @@ def go(code: str):
     long_url = get_long_url(code)
     if long_url is None:
         raise HTTPException(status_code=404, detail="Short link not found")
-    run("UPDATE links SET clicks = clicks + 1 WHERE code = ?", (code,))
+    click_queue.put(code)  # just drop the click in the queue, don't wait for the DB
     return RedirectResponse(long_url)
